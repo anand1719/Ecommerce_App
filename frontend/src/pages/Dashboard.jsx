@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { createProduct, getKafkaStatus, getProducts } from '../services/api';
+import { createProduct, getKafkaStatus, getProducts, updateProduct } from '../services/api';
 
 const WS_BASE = `ws://${window.location.hostname}:8000/api/v1/ws/kafka/events`;
 
@@ -42,6 +42,18 @@ export default function Dashboard() {
   const successTimer = useRef(null);
   const errorTimer = useRef(null);
   const [expandedDesc, setExpandedDesc] = useState(new Set());
+  const [editingProduct, setEditingProduct] = useState(null);
+  const [editSku, setEditSku] = useState('');
+  const [editName, setEditName] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [editPrice, setEditPrice] = useState('');
+  const [editStockQuantity, setEditStockQuantity] = useState('');
+  const [editIsActive, setEditIsActive] = useState(true);
+  const [editError, setEditError] = useState('');
+  const [editSuccess, setEditSuccess] = useState('');
+  const [editSubmitting, setEditSubmitting] = useState(false);
+  const editSuccessTimer = useRef(null);
+  const editErrorTimer = useRef(null);
 
   // Fetch existing products and Kafka status on mount
   useEffect(() => {
@@ -97,6 +109,8 @@ export default function Dashboard() {
     return () => {
       if (successTimer.current) clearTimeout(successTimer.current);
       if (errorTimer.current) clearTimeout(errorTimer.current);
+      if (editSuccessTimer.current) clearTimeout(editSuccessTimer.current);
+      if (editErrorTimer.current) clearTimeout(editErrorTimer.current);
     };
   }, []);
 
@@ -152,6 +166,74 @@ export default function Dashboard() {
         ? products
         : [];
 
+  const user = (() => {
+    try { return JSON.parse(localStorage.getItem('user') || '{}'); } catch { return {}; }
+  })();
+  const isAdmin = user.role === 'admin';
+
+  const openEditModal = (product) => {
+    setEditingProduct(product);
+    setEditSku(product.sku || '');
+    setEditName(product.name || '');
+    setEditDescription(product.description || '');
+    setEditPrice(product.price?.toString() || '');
+    setEditStockQuantity(product.stock_quantity?.toString() || '');
+    setEditIsActive(product.is_active ?? true);
+    setEditError('');
+    setEditSuccess('');
+  };
+
+  const closeEditModal = () => {
+    setEditingProduct(null);
+    setEditError('');
+    setEditSuccess('');
+  };
+
+  const handleUpdateProduct = async (e) => {
+    e.preventDefault();
+    if (!editingProduct) return;
+    setEditError('');
+    setEditSuccess('');
+    setEditSubmitting(true);
+
+    try {
+      const payload = {};
+      if (editSku !== editingProduct.sku) payload.sku = editSku;
+      if (editName !== editingProduct.name) payload.name = editName;
+      if (editDescription !== (editingProduct.description || '')) payload.description = editDescription || null;
+      if (parseFloat(editPrice) !== parseFloat(editingProduct.price)) payload.price = parseFloat(editPrice);
+      if (parseInt(editStockQuantity, 10) !== (editingProduct.stock_quantity ?? 0)) payload.stock_quantity = parseInt(editStockQuantity, 10);
+      if (editIsActive !== editingProduct.is_active) payload.is_active = editIsActive;
+
+      if (Object.keys(payload).length === 0) {
+        setEditError('No changes detected.');
+        setEditSubmitting(false);
+        return;
+      }
+
+      const res = await updateProduct(editingProduct.id, payload);
+      const updatedProduct = res.data;
+
+      setProducts((prev) =>
+        prev.map((p) => (p.id === updatedProduct.id ? updatedProduct : p))
+      );
+
+      setEditSuccess(`Product "${updatedProduct.name}" updated successfully!`);
+      if (editErrorTimer.current) clearTimeout(editErrorTimer.current);
+      editSuccessTimer.current = setTimeout(() => {
+        setEditSuccess('');
+        closeEditModal();
+      }, 2000);
+    } catch (err) {
+      const detail = err.response?.data?.detail || 'Failed to update product.';
+      setEditError(typeof detail === 'string' ? detail : JSON.stringify(detail));
+      if (editSuccessTimer.current) clearTimeout(editSuccessTimer.current);
+      editErrorTimer.current = setTimeout(() => setEditError(''), 6000);
+    } finally {
+      setEditSubmitting(false);
+    }
+  };
+
   const toggleDescription = (productId) => {
     setExpandedDesc((prev) => {
       const next = new Set(prev);
@@ -195,9 +277,11 @@ export default function Dashboard() {
 
       {/* Action Bar */}
       <div className="action-bar">
-        <button className="btn-action" onClick={() => setShowForm(!showForm)}>
-          {showForm ? '− Cancel' : '+ New Product'}
-        </button>
+        {isAdmin && (
+          <button className="btn-action" onClick={() => setShowForm(!showForm)}>
+            {showForm ? '− Cancel' : '+ New Product'}
+          </button>
+        )}
       </div>
 
       {/* Toast notifications */}
@@ -338,18 +422,123 @@ export default function Dashboard() {
                       )}
                       {expandedDesc.has(product.id) && product.description.split(' ').length > 2 && (
                         <span className="more-link" onClick={() => toggleDescription(product.id)}> less</span>
-                      )}                    
+                      )}
                     </span>
                   </div>
                 )}
               </div>
               <div className="product-card-footer">
-                <span className="event-type-badge">ID: {product.id?.substring(0, 8)}...</span>
+                <span className="event-type-badge">ID: {product.id}</span>
+                <button className="btn-cart" onClick={() => addToCart(product)}>
+                  🛒 Add to Cart
+                </button>
+                {isAdmin && (
+                  <button className="btn-update" onClick={() => openEditModal(product)}>
+                    Update
+                  </button>
+                )}
               </div>
             </div>
           ))
         )}
       </div>
+
+      {/* Update Product Modal */}
+      {editingProduct && (
+        <div className="modal-overlay" onClick={closeEditModal}>
+          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
+            <button className="modal-close" onClick={closeEditModal}>
+              ×
+            </button>
+            <h3>Update Product</h3>
+            {editSuccess && <div className="success-message">{editSuccess}</div>}
+            {editError && <div className="error-message">{editError}</div>}
+            <form onSubmit={handleUpdateProduct}>
+              <div className="form-row">
+                <div className="form-group">
+                  <label htmlFor="editSku">SKU *</label>
+                  <input
+                    id="editSku"
+                    type="text"
+                    value={editSku}
+                    onChange={(e) => setEditSku(e.target.value)}
+                    placeholder="PROD-001"
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="editName">Name *</label>
+                  <input
+                    id="editName"
+                    type="text"
+                    value={editName}
+                    onChange={(e) => setEditName(e.target.value)}
+                    placeholder="Product Name"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="editDesc">Description</label>
+                <textarea
+                  id="editDesc"
+                  value={editDescription}
+                  onChange={(e) => setEditDescription(e.target.value)}
+                  placeholder="Product description (optional)"
+                  rows={2}
+                />
+              </div>
+
+              <div className="form-row">
+                <div className="form-group">
+                  <label htmlFor="editPrice">Price *</label>
+                  <input
+                    id="editPrice"
+                    type="number"
+                    step="0.01"
+                    min="0.01"
+                    value={editPrice}
+                    onChange={(e) => setEditPrice(e.target.value)}
+                    placeholder="29.99"
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label htmlFor="editStock">Stock Quantity *</label>
+                  <input
+                    id="editStock"
+                    type="number"
+                    step="1"
+                    min="0"
+                    value={editStockQuantity}
+                    onChange={(e) => setEditStockQuantity(e.target.value)}
+                    placeholder="100"
+                    required
+                  />
+                </div>
+              </div>
+
+              <div className="form-group">
+                <label htmlFor="editIsActive">
+                  <input
+                    id="editIsActive"
+                    type="checkbox"
+                    checked={editIsActive}
+                    onChange={(e) => setEditIsActive(e.target.checked)}
+                    style={{ marginRight: '0.5rem' }}
+                  />
+                  Active
+                </label>
+              </div>
+
+              <button type="submit" className="btn-primary" disabled={editSubmitting}>
+                {editSubmitting ? 'Updating...' : 'Update Product'}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

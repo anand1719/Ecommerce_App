@@ -1,14 +1,33 @@
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { createProduct, getKafkaStatus, getProducts, updateProduct } from '../services/api';
+import { createProduct, createSales, getKafkaStatus, getProducts, updateProduct } from '../services/api';
 
 const WS_BASE = `ws://${window.location.hostname}:8000/api/v1/ws/kafka/events`;
+
+const CART_KEY = 'cart';
 
 function generateId() {
   try {
     return crypto.randomUUID();
   } catch {
     return Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+  }
+}
+
+function loadCart() {
+  try {
+    const data = localStorage.getItem(CART_KEY);
+    return data ? JSON.parse(data) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveCart(cart) {
+  try {
+    localStorage.setItem(CART_KEY, JSON.stringify(cart));
+  } catch {
+    // ignore
   }
 }
 
@@ -27,6 +46,7 @@ export default function Dashboard() {
   const [kafkaStatus, setKafkaStatus] = useState(null);
   const [connected, setConnected] = useState(false);
   const [filter, setFilter] = useState('all');
+  const [searchQuery, setSearchQuery] = useState('');
   const [showForm, setShowForm] = useState(false);
   const [formError, setFormError] = useState('');
   const [formSuccess, setFormSuccess] = useState('');
@@ -54,6 +74,18 @@ export default function Dashboard() {
   const [editSubmitting, setEditSubmitting] = useState(false);
   const editSuccessTimer = useRef(null);
   const editErrorTimer = useRef(null);
+
+  // Cart state
+  const [cart, setCart] = useState(loadCart);
+  const [showCart, setShowCart] = useState(false);
+  const [cartToast, setCartToast] = useState('');
+  const cartToastTimer = useRef(null);
+  const [checkoutSubmitting, setCheckoutSubmitting] = useState(false);
+
+  // Sync cart to localStorage whenever it changes
+  useEffect(() => {
+    saveCart(cart);
+  }, [cart]);
 
   // Fetch existing products and Kafka status on mount
   useEffect(() => {
@@ -111,6 +143,7 @@ export default function Dashboard() {
       if (errorTimer.current) clearTimeout(errorTimer.current);
       if (editSuccessTimer.current) clearTimeout(editSuccessTimer.current);
       if (editErrorTimer.current) clearTimeout(editErrorTimer.current);
+      if (cartToastTimer.current) clearTimeout(cartToastTimer.current);
     };
   }, []);
 
@@ -159,12 +192,19 @@ export default function Dashboard() {
     }
   };
 
-  const filteredProducts =
-    filter === 'all'
-      ? products
-      : filter === 'products'
-        ? products
-        : [];
+  const filteredProducts = (() => {
+    let list = filter === 'all' ? products : filter === 'products' ? products : [];
+    if (searchQuery.trim()) {
+      const q = searchQuery.trim().toLowerCase();
+      list = list.filter(
+        (p) =>
+          (p.name && p.name.toLowerCase().includes(q)) ||
+          (p.sku && p.sku.toLowerCase().includes(q)) ||
+          (p.description && p.description.toLowerCase().includes(q))
+      );
+    }
+    return list;
+  })();
 
   const user = (() => {
     try { return JSON.parse(localStorage.getItem('user') || '{}'); } catch { return {}; }
@@ -245,6 +285,91 @@ export default function Dashboard() {
       return next;
     });
   };
+
+  // ─── Cart functions ──────────────────────────────────────────────────────────
+
+  const showCartToastMsg = (msg) => {
+    setCartToast(msg);
+    if (cartToastTimer.current) clearTimeout(cartToastTimer.current);
+    cartToastTimer.current = setTimeout(() => setCartToast(''), 3000);
+  };
+
+  const addToCart = (product) => {
+    setCart((prev) => {
+      const existing = prev.find((item) => item.product.id === product.id);
+      if (existing) {
+        return prev.map((item) =>
+          item.product.id === product.id
+            ? { ...item, quantity: item.quantity + 1 }
+            : item
+        );
+      }
+      return [...prev, { product, quantity: 1 }];
+    });
+    showCartToastMsg(`Added "${product.name}" to cart`);
+  };
+
+  const removeFromCart = (productId) => {
+    setCart((prev) => prev.filter((item) => item.product.id !== productId));
+  };
+
+  const incrementQuantity = (productId) => {
+    setCart((prev) =>
+      prev.map((item) =>
+        item.product.id === productId
+          ? { ...item, quantity: item.quantity + 1 }
+          : item
+      )
+    );
+  };
+
+  const decrementQuantity = (productId) => {
+    setCart((prev) => {
+      const item = prev.find((i) => i.product.id === productId);
+      if (!item) return prev;
+      if (item.quantity <= 1) {
+        return prev.filter((i) => i.product.id !== productId);
+      }
+      return prev.map((i) =>
+        i.product.id === productId
+          ? { ...i, quantity: i.quantity - 1 }
+          : i
+      );
+    });
+  };
+
+  const clearCart = () => {
+    setCart([]);
+    showCartToastMsg('Cart cleared');
+  };
+
+  const cartTotal = cart.reduce(
+    (sum, item) => sum + (Math.round(parseFloat(item.product.price)) || 0) * item.quantity,
+    0
+  );
+
+  const cartItemCount = cart.reduce((sum, item) => sum + item.quantity, 0);
+
+  const handleCheckout = async () => {
+    if (cart.length === 0) return;
+    setCheckoutSubmitting(true);
+    try {
+      const items = cart.map((item) => ({
+        product_id: item.product.id,
+        quantity: item.quantity,
+      }));
+      await createSales({ items });
+      setCart([]);
+      showCartToastMsg('Checkout successful!');
+      setShowCart(false);
+    } catch (err) {
+      const detail = err.response?.data?.detail || 'Checkout failed.';
+      showCartToastMsg(typeof detail === 'string' ? detail : 'Checkout failed.');
+    } finally {
+      setCheckoutSubmitting(false);
+    }
+  };
+
   return (
     <div className="dashboard">
       {/* Header */}
@@ -260,6 +385,14 @@ export default function Dashboard() {
           <button className="btn-theme" onClick={() => setIsLight((prev) => !prev)} title={isLight ? 'Switch to dark mode' : 'Switch to light mode'}>
             {isLight ? '🌙' : '☀️'}
           </button>
+          <button className="btn-cart-header" onClick={() => setShowCart(!showCart)} title="Shopping Cart">
+            <svg xmlns="http://www.w3.org/2000/svg" width="1em" height="1em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{verticalAlign: 'middle'}}>
+              <circle cx="9" cy="21" r="1"/>
+              <circle cx="20" cy="21" r="1"/>
+              <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/>
+            </svg>
+            {cartItemCount > 0 && <span className="cart-badge">{cartItemCount}</span>}
+          </button>
           <button className="btn-logout" onClick={handleLogout}>
             Logout
           </button>
@@ -273,6 +406,18 @@ export default function Dashboard() {
         <span className="status-item">Real-time: {connected ? 'Connected' : 'Offline'}</span>
         <span className="status-separator">|</span>
         <span className="event-badge">{filteredProducts.length} products</span>
+        <div className="status-bar-search">
+          <svg xmlns="http://www.w3.org/2000/svg" width="0.85em" height="0.85em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="11" cy="11" r="8"/>
+            <path d="m21 21-4.35-4.35"/>
+          </svg>
+          <input
+            type="text"
+            placeholder="Search products..."
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+          />
+        </div>
       </div>
 
       {/* Action Bar */}
@@ -287,8 +432,8 @@ export default function Dashboard() {
       {/* Toast notifications */}
       {formSuccess && <div className="toast toast-success">{formSuccess}</div>}
       {formError && <div className="toast toast-error">{formError}</div>}
+      {cartToast && <div className="toast toast-success">{cartToast}</div>}
 
-      {/* Create Product Form */}
       {/* Create Product Modal */}
       {showForm && (
         <div className="modal-overlay" onClick={() => setShowForm(false)}>
@@ -428,9 +573,16 @@ export default function Dashboard() {
                 )}
               </div>
               <div className="product-card-footer">
-                <span className="event-type-badge">ID: {product.id}</span>
+                <span className="event-type-badge" title={product.id}>
+                  ID: {product.id?.slice(0, 15)}...
+                </span>
                 <button className="btn-cart" onClick={() => addToCart(product)}>
-                  🛒 Add to Cart
+                  <svg xmlns="http://www.w3.org/2000/svg" width="0.9em" height="0.9em" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{verticalAlign: 'middle', marginRight: '0.25rem'}}>
+                    <circle cx="9" cy="21" r="1"/>
+                    <circle cx="20" cy="21" r="1"/>
+                    <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"/>
+                  </svg>
+                  Add to Cart
                 </button>
                 {isAdmin && (
                   <button className="btn-update" onClick={() => openEditModal(product)}>
@@ -442,6 +594,75 @@ export default function Dashboard() {
           ))
         )}
       </div>
+
+      {/* Cart Side Panel */}
+      {showCart && (
+        <div className="cart-overlay" onClick={() => setShowCart(false)}>
+          <div className="cart-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="cart-panel-header">
+              <h3>Shopping Cart</h3>
+              <button className="modal-close" onClick={() => setShowCart(false)}>×</button>
+            </div>
+            {cart.length === 0 ? (
+              <div className="cart-empty">
+                <p>Your cart is empty.</p>
+              </div>
+            ) : (
+              <>
+                <div className="cart-items">
+                  {cart.map((item) => (
+                    <div key={item.product.id} className="cart-item">
+                      <div className="cart-item-info">
+                        <span className="cart-item-name">{item.product.name}</span>
+                        <span className="cart-item-price">₹{Math.round(item.product.price) || 0} each</span>
+                      </div>
+                      <div className="cart-item-controls">
+                        <button
+                          className="btn-qty"
+                          onClick={() => decrementQuantity(item.product.id)}
+                          title="Decrease quantity"
+                        >−</button>
+                        <span className="cart-item-qty">{item.quantity}</span>
+                        <button
+                          className="btn-qty"
+                          onClick={() => incrementQuantity(item.product.id)}
+                          title="Increase quantity"
+                        >+</button>
+                        <button
+                          className="btn-remove-item"
+                          onClick={() => removeFromCart(item.product.id)}
+                          title="Remove item"
+                        >🗑</button>
+                      </div>
+                      <div className="cart-item-line-total">
+                        ₹{(Math.round(parseFloat(item.product.price)) || 0) * item.quantity}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="cart-footer">
+                  <div className="cart-total">
+                    <span>Total:</span>
+                    <span>₹{cartTotal}</span>
+                  </div>
+                  <div className="cart-actions">
+                    <button className="btn-secondary" onClick={clearCart}>
+                      Clear Cart
+                    </button>
+                    <button
+                      className="btn-primary"
+                      onClick={handleCheckout}
+                      disabled={checkoutSubmitting}
+                    >
+                      {checkoutSubmitting ? 'Processing...' : 'Checkout'}
+                    </button>
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Update Product Modal */}
       {editingProduct && (
